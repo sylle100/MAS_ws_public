@@ -1,2 +1,2 @@
 # MAS_ws_public
-# MAS_ws_public
+Git repo for MAS class
