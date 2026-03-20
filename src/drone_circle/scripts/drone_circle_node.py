@@ -90,7 +90,9 @@ class DroneCircle(Node):
         self.joint_pose = [0.0, 0.0]
         self.local_pose_received = False
 
-        self.circle_center = np.array([2.0, 0.0, 2.0], dtype=float)
+        self.circle_height = 2.0
+        self.max_height = 2.0
+        self.circle_center = np.array([2.0, 0.0, self.circle_height], dtype=float)
         self.circle_radius = 2.0
         self.circle_angular_speed = 0.35  # rad/s
         self.position_gain = 0.8
@@ -98,7 +100,7 @@ class DroneCircle(Node):
         self.goto_tolerance = 0.15
         self.flight_phase = "goto"
         self.circle_angle = 0.0
-        self.goto_target = self.circle_center.copy()
+        self.goto_target = self.circle_center + np.array([self.circle_radius, 0.0, 0.0], dtype=float)
 
         # null space
         self.pose_des = [0, 0, 0, 0, 0, np.pi / 2]
@@ -213,7 +215,7 @@ class DroneCircle(Node):
                 self.circle_angle = 0.0
                 self.setpoint_pose = self.goto_target.copy()
                 self.get_logger().info(
-                    "Reached (2, 0, 2). Starting continuous circle centered at (2, 0, 2) with radius 2 m."
+                    "Reached the circle start point. Starting a horizontal circle at 2 m height with a 2 m radius."
                 )
             return
 
@@ -238,7 +240,7 @@ class DroneCircle(Node):
 
         dt = max(dt, 1e-3)
         self.update_drone_trajectory(dt)
-        self.setpoint_pose[2] = max(self.setpoint_pose[2], 0.1)
+        self.setpoint_pose[2] = np.clip(self.setpoint_pose[2], 0.1, self.max_height)
 
         self.publish_setpoint()
         self.log_manual_offboard_status()
