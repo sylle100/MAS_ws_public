@@ -8,7 +8,7 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, Quaternion, PoseStamped
 from rclpy.qos import ReliabilityPolicy, QoSProfile
 
-import numpy as np
+import math
 
 from drone_circle.orientation_funcs import euler_from_quaternion, quaternion_from_euler
 
@@ -83,7 +83,7 @@ class DroneCircle(Node):
         )
 
         self.current_state = State()
-        self.drone_pose = np.zeros(3, dtype=float)
+        self.drone_pose = [0.0, 0.0, 0.0]
         self.setpoint_pose = None
         self.yaw = 0.0
         self.setpoint_yaw = 0.0
@@ -91,19 +91,24 @@ class DroneCircle(Node):
         self.local_pose_received = False
 
         self.circle_height = 2.0
+        self.min_goto_height = 1.5
         self.max_height = 2.0
-        self.circle_center = np.array([2.0, 0.0, self.circle_height], dtype=float)
+        self.circle_center = [2.0, 0.0, self.circle_height]
         self.circle_radius = 2.0
-        self.circle_angular_speed = 0.35  # rad/s
+        self.circle_angular_speed = 0.20  # rad/s
+        self.transition_duration = 3.0
+        self.max_yaw_rate = 0.8  # rad/s
         self.position_gain = 0.8
         self.max_linear_speed = 0.8
         self.goto_tolerance = 0.15
         self.flight_phase = "goto"
         self.circle_angle = 0.0
-        self.goto_target = self.circle_center + np.array([self.circle_radius, 0.0, 0.0], dtype=float)
+        self.transition_time = 0.0
+        self.transition_radius = 0.0
+        self.goto_target = self.circle_center.copy()
 
         # null space
-        self.pose_des = [0, 0, 0, 0, 0, np.pi / 2]
+        self.pose_des = [0, 0, 0, 0, 0, math.pi / 2]
         self.pose_k = [0, 0, 0, 0, 1, 1]
 
         self.last_time = self.get_clock().now()
@@ -131,10 +136,11 @@ class DroneCircle(Node):
 
     def drone_pos_callback(self, msg: PoseStamped):
         self.local_pose_received = True
-        self.drone_pose = np.array(
-            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
-            dtype=float
-        )
+        self.drone_pose = [
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(msg.pose.position.z),
+        ]
         if self.setpoint_pose is None:
             self.setpoint_pose = self.drone_pose.copy()
             self.setpoint_yaw = self.yaw
@@ -188,49 +194,93 @@ class DroneCircle(Node):
         """Desired null space"""
         (t0, t1) = self.joint_pose
 
-        v = np.array([
-            [self.pose_k[0] * 0],
-            [self.pose_k[1] * 0],
-            [self.pose_k[2] * 0],
-            [self.pose_k[3] * 0],
-            [self.pose_k[4] * (self.pose_des[4] - t0)],
-            [self.pose_k[5] * (self.pose_des[5] - t1)]
-        ])
+        v = [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            self.pose_k[4] * (self.pose_des[4] - t0),
+            self.pose_k[5] * (self.pose_des[5] - t1),
+        ]
         return v
 
-    def limit_velocity(self, velocity: np.ndarray) -> np.ndarray:
-        speed = np.linalg.norm(velocity)
+    def limit_velocity(self, velocity):
+        speed = math.sqrt(sum(component * component for component in velocity))
         if speed > self.max_linear_speed:
-            return velocity * (self.max_linear_speed / speed)
+            scale = self.max_linear_speed / speed
+            return [component * scale for component in velocity]
         return velocity
+
+    def wrap_angle(self, angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def update_setpoint_yaw(self, desired_yaw: float, dt: float):
+        yaw_error = self.wrap_angle(desired_yaw - self.setpoint_yaw)
+        max_step = self.max_yaw_rate * dt
+        yaw_step = max(-max_step, min(max_step, yaw_error))
+        self.setpoint_yaw = self.wrap_angle(self.setpoint_yaw + yaw_step)
 
     def update_drone_trajectory(self, dt: float):
         if self.flight_phase == "goto":
-            position_error = self.goto_target - self.drone_pose
-            velocity_cmd = self.limit_velocity(self.position_gain * position_error)
-            self.setpoint_pose = self.drone_pose + velocity_cmd * dt
+            position_error = [
+                self.goto_target[i] - self.drone_pose[i]
+                for i in range(3)
+            ]
+            velocity_cmd = self.limit_velocity([
+                self.position_gain * component for component in position_error
+            ])
+            self.setpoint_pose = [
+                self.drone_pose[i] + velocity_cmd[i] * dt
+                for i in range(3)
+            ]
+            self.setpoint_pose[2] = max(self.setpoint_pose[2], self.min_goto_height)
 
-            if np.linalg.norm(position_error) < self.goto_tolerance:
-                self.flight_phase = "circle"
+            if math.sqrt(sum(component * component for component in position_error)) < self.goto_tolerance:
+                self.flight_phase = "transition"
                 self.circle_angle = 0.0
-                self.setpoint_pose = self.goto_target.copy()
+                self.transition_time = 0.0
+                self.transition_radius = 0.0
+                self.setpoint_pose = self.circle_center.copy()
                 self.get_logger().info(
-                    "Reached the circle start point. Starting a horizontal circle at 2 m height with a 2 m radius."
+                    "Reached (2, 0, 2). Blending smoothly into the horizontal circle."
+                )
+            return
+
+        if self.flight_phase == "transition":
+            self.transition_time += dt
+            transition_alpha = min(self.transition_time / self.transition_duration, 1.0)
+            smooth_alpha = 0.5 - 0.5 * math.cos(math.pi * transition_alpha)
+            angular_speed = self.circle_angular_speed * smooth_alpha
+            self.circle_angle += angular_speed * dt
+            self.transition_radius = self.circle_radius * smooth_alpha
+            self.setpoint_pose = [
+                self.circle_center[0] + self.transition_radius * math.cos(self.circle_angle),
+                self.circle_center[1] + self.transition_radius * math.sin(self.circle_angle),
+                self.circle_center[2],
+            ]
+            tangent_yaw = self.circle_angle + (math.pi / 2.0)
+            self.update_setpoint_yaw(tangent_yaw, dt)
+
+            if transition_alpha >= 1.0:
+                self.flight_phase = "circle"
+                self.transition_radius = self.circle_radius
+                self.get_logger().info(
+                    "Transition complete. Continuing the horizontal circle."
                 )
             return
 
         self.circle_angle += self.circle_angular_speed * dt
-        self.setpoint_pose = np.array([
-            self.circle_center[0] + self.circle_radius * np.cos(self.circle_angle),
-            self.circle_center[1] + self.circle_radius * np.sin(self.circle_angle),
-            self.circle_center[2]
-        ], dtype=float)
+        self.setpoint_pose = [
+            self.circle_center[0] + self.circle_radius * math.cos(self.circle_angle),
+            self.circle_center[1] + self.circle_radius * math.sin(self.circle_angle),
+            self.circle_center[2],
+        ]
 
-        tangent_yaw = self.circle_angle + (np.pi / 2.0)
-        self.setpoint_yaw = tangent_yaw
+        tangent_yaw = self.circle_angle + (math.pi / 2.0)
+        self.update_setpoint_yaw(tangent_yaw, dt)
 
     def timer_callback(self):
-        """Move to the entry point, then keep flying a circle."""
+        """Move to the circle center, then blend smoothly into the circle."""
         now = self.get_clock().now()
         dt = (now - self.last_time).nanoseconds / 1e9
         self.last_time = now
@@ -240,14 +290,14 @@ class DroneCircle(Node):
 
         dt = max(dt, 1e-3)
         self.update_drone_trajectory(dt)
-        self.setpoint_pose[2] = np.clip(self.setpoint_pose[2], 0.1, self.max_height)
+        self.setpoint_pose[2] = min(max(self.setpoint_pose[2], 0.1), self.max_height)
 
         self.publish_setpoint()
         self.log_manual_offboard_status()
 
         v = self.get_v()
-        t0 = self.joint_pose[0] + v[4][0] * dt
-        t1 = self.joint_pose[1] + v[5][0] * dt
+        t0 = self.joint_pose[0] + v[4] * dt
+        t1 = self.joint_pose[1] + v[5] * dt
 
         cmd_arm = Float64MultiArray()
         cmd_arm.data = [t0, t1]
