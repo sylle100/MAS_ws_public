@@ -72,7 +72,8 @@ class GimbalPublisher(Node):
         # self.get_logger().info(f"Pitch: {pitch_deg:.2f}°")
         # self.get_logger().info(f"Yaw: {yaw_deg:.2f}°")
         msg = Float64MultiArray()
-        msg.data = [-pitch, -roll]
+        msg.data = [-pitch_deg, -roll_deg]
+        print(f"Publishing: {msg.data}")
         self.publisher_.publish(msg)
         
 
