@@ -93,7 +93,7 @@ class DroneCircle(Node):
         self.circle_height = 2.0
         self.min_goto_height = 1.5
         self.max_height = 2.0
-        self.circle_center = [2.0, 0.0, self.circle_height]
+        self.circle_center = [0.0, 0.0, self.circle_height]
         self.circle_radius = 2.0
         self.circle_angular_speed = 0.20  # rad/s
         self.transition_duration = 3.0
