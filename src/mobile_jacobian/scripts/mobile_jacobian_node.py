@@ -122,7 +122,7 @@ class mobilejacobian(Node):
 
         # Control parameters
         self.links = np.array([0.15, 0.15])
-        self.k = 1
+        self.k = 0.6
 
         # Safety limits
         self.min_z = 0.1  # minimum allowed altitude for commanded setpoint (meters)
@@ -140,6 +140,11 @@ class mobilejacobian(Node):
         self.target_index = 0
 
         self.hover_height = 0.2  # meters above target
+        self.approach_height = 0.2  # meters above hover height for overhead approach
+        self.descend_radius_xy = 0.08  # only descend when nearly centered above the target
+        self.target_avoid_radius = 0.18  # meters; protected bubble around each target
+        self.target_avoid_influence = 0.35  # meters; start bending away before reaching the bubble
+        self.target_avoid_gain = 0.25  # m/s of repulsive task-space velocity at the bubble edge
         self.hover_duration = 5.0  # seconds
         self.arrival_threshold = 0.05  # meters, to consider "arrived" at a point (for phase switching)
 
@@ -147,9 +152,14 @@ class mobilejacobian(Node):
         self.last_time = self.get_clock().now()
 
         # Limits for commanded velocities
-        self.max_linear_vel = 0.5  # m/s
-        self.max_angular_vel = 1.0  # rad/s
-        self.max_joint_vel = 1.0  # rad/s
+        self.max_linear_vel = 0.3  # m/s
+        self.max_angular_vel = 0.6  # rad/s
+        self.max_joint_vel = 0.6  # rad/s
+        self.max_linear_acc = 0.5  # m/s^2
+        self.max_angular_acc = 0.8  # rad/s^2
+        self.max_joint_acc = 1.0  # rad/s^2
+        self.approach_smoothing = 0.25  # meters; larger values soften long moves
+        self.last_q_dot = np.zeros((6, 1))
 
         self.timer = self.create_timer(.1, self.timer_callback)
 
@@ -201,8 +211,30 @@ class mobilejacobian(Node):
             [desired_pos[2] - z],
         ])
 
-        # k is a velocity scalar
-        return error * self.k
+        error_norm = np.linalg.norm(error)
+        if error_norm < 1e-6:
+            return np.zeros((3, 1))
+
+        # Use a smooth saturating profile so large target jumps do not create a lunge.
+        speed_scale = np.tanh(error_norm / self.approach_smoothing)
+        return error * (self.k * speed_scale)
+
+    def _rate_limit(self, q_dot: np.ndarray, dt: float) -> np.ndarray:
+        """Limit acceleration so command changes ramp in smoothly."""
+        if dt <= 0.0:
+            return q_dot
+
+        max_delta = np.array([
+            self.max_linear_acc * dt,
+            self.max_linear_acc * dt,
+            self.max_linear_acc * dt,
+            self.max_angular_acc * dt,
+            self.max_joint_acc * dt,
+            self.max_joint_acc * dt,
+        ]).reshape(6, 1)
+
+        delta = q_dot - self.last_q_dot
+        return self.last_q_dot + np.clip(delta, -max_delta, max_delta)
 
     def _compute_desired_position(self) -> np.ndarray:
         """Compute the desired drone position for the current mission phase."""
@@ -221,16 +253,80 @@ class mobilejacobian(Node):
                 return self.start_pose
 
             target = self.targets[self.target_index].copy()
-            target[2] += self.hover_height
-            # Safety: never command below minimum altitude
-            target[2] = max(target[2], self.min_z)
-            return target
+            hover_pos = target.copy()
+            hover_pos[2] = max(target[2] + self.hover_height, self.min_z)
+
+            if self.phase == 'hover':
+                return hover_pos
+
+            current_pos = np.array([
+                self.end_effector_pose.position.x,
+                self.end_effector_pose.position.y,
+                self.end_effector_pose.position.z,
+            ])
+            overhead_pos = hover_pos.copy()
+            overhead_pos[2] += self.approach_height
+
+            horizontal_dist = np.linalg.norm(current_pos[:2] - target[:2])
+            overhead_ready = current_pos[2] >= (overhead_pos[2] - self.arrival_threshold)
+
+            # First move above the target, then descend vertically once centered.
+            if horizontal_dist > self.descend_radius_xy or not overhead_ready:
+                return overhead_pos
+            return hover_pos
 
         if self.phase == 'return':
             return self.start_pose
 
         # done
         return self.start_pose
+
+    def _compute_target_avoidance_velocity(self, current_pos: np.ndarray) -> np.ndarray:
+        """Generate a repulsive task-space velocity around targets and upward near them."""
+        avoid = np.zeros((3, 1))
+
+        for idx, target_received in enumerate(self.targets_received):
+            if not target_received:
+                continue
+
+            target = self.targets[idx].copy()
+            safe_hover_z = max(target[2] + self.hover_height, self.min_z)
+            safe_overhead_z = safe_hover_z + self.approach_height
+
+            xy_delta = current_pos[:2] - target[:2]
+            xy_dist = np.linalg.norm(xy_delta)
+
+            if xy_dist >= self.target_avoid_influence:
+                continue
+
+            active_target = idx == self.target_index and self.phase in ('goto', 'hover')
+            if active_target and current_pos[2] >= safe_overhead_z - self.arrival_threshold:
+                # Once we are safely overhead, allow the vertical approach.
+                continue
+
+            if xy_dist < 1e-6:
+                xy_dir = np.array([1.0, 0.0])
+            else:
+                xy_dir = xy_delta / xy_dist
+
+            if xy_dist <= self.target_avoid_radius:
+                horizontal_strength = self.target_avoid_gain
+            else:
+                ratio = (self.target_avoid_influence - xy_dist) / (
+                    self.target_avoid_influence - self.target_avoid_radius
+                )
+                horizontal_strength = self.target_avoid_gain * ratio
+
+            upward_ratio = max(0.0, safe_overhead_z - current_pos[2]) / max(self.approach_height, 1e-6)
+            upward_strength = self.target_avoid_gain * min(1.0, upward_ratio)
+
+            avoid += np.array([
+                [xy_dir[0] * horizontal_strength],
+                [xy_dir[1] * horizontal_strength],
+                [upward_strength],
+            ])
+
+        return avoid
 
     def get_v(self):
         """Desired null space"""
@@ -265,7 +361,6 @@ class mobilejacobian(Node):
                                 self.end_effector_pose.position.y,
                                 self.end_effector_pose.position.z])
         dist = np.linalg.norm(current_pos - desired_pos)
-        now = self.get_clock().now()
 
         if self.phase == 'goto' and dist < self.arrival_threshold:
             self.phase = 'hover'
@@ -300,6 +395,7 @@ class mobilejacobian(Node):
 
         # q task
         pd_des = self.get_p_dot_des(desired_pos)
+        pd_des += self._compute_target_avoidance_velocity(current_pos)
         q_task = j_mobile_inv @ pd_des
 
         # q Null
@@ -312,17 +408,20 @@ class mobilejacobian(Node):
         else:
             q_dot = q_task + q_null
 
-        # Clamp commanded velocities to reasonable limits
-        q_dot[0:3, 0] = np.clip(q_dot[0:3, 0], -self.max_linear_vel, self.max_linear_vel)
-        q_dot[3, 0] = np.clip(q_dot[3, 0], -self.max_angular_vel, self.max_angular_vel)
-        q_dot[4:6, 0] = np.clip(q_dot[4:6, 0], -self.max_joint_vel, self.max_joint_vel)
-
         # Integrate velocity to get next setpoint using actual elapsed time
         now = self.get_clock().now()
         dt = (now - self.last_time).nanoseconds * 1e-9
         if dt <= 0:
             dt = 1e-3
         self.last_time = now
+
+        q_dot = self._rate_limit(q_dot, dt)
+
+        # Clamp commanded velocities to reasonable limits
+        q_dot[0:3, 0] = np.clip(q_dot[0:3, 0], -self.max_linear_vel, self.max_linear_vel)
+        q_dot[3, 0] = np.clip(q_dot[3, 0], -self.max_angular_vel, self.max_angular_vel)
+        q_dot[4:6, 0] = np.clip(q_dot[4:6, 0], -self.max_joint_vel, self.max_joint_vel)
+        self.last_q_dot = q_dot.copy()
 
         # update commanded setpoint based on computed velocity
         if self.setpoint_pose is None:
@@ -361,8 +460,8 @@ class mobilejacobian(Node):
 
 
         # update arm joint position based on velosity
-        t0 = self.joint_pose[0] + q_dot[4][0]
-        t1 = self.joint_pose[1] + q_dot[5][0]
+        t0 = self.joint_pose[0] + q_dot[4][0] * dt
+        t1 = self.joint_pose[1] + q_dot[5][0] * dt
         
         cmd_arm = Float64MultiArray()
 
@@ -442,5 +541,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-
