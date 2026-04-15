@@ -13,12 +13,12 @@ class ArmCirclePublisher(Node):
         # Parameters (motion)
         self.declare_parameter('radius', 0.5)         # radians amplitude
         self.declare_parameter('frequency', 0.2)      # Hz
-        self.declare_parameter('center', [0.0, 1.4])  # joint offsets [θ1_0, θ2_0]
+        self.declare_parameter('center', [0.0, 0.15])  # joint offsets [θ1_0, θ2_0]
         self.declare_parameter('rate', 50.0)
 
         # Parameters (forward kinematics)
-        self.declare_parameter('l1', 1.0)  # link1 length
-        self.declare_parameter('l2', 1.0)  # link2 length
+        self.declare_parameter('l1', 0.15)  # link1 length
+        self.declare_parameter('l2', 0.1383)  # link2 length
         self.declare_parameter('fk_log_hz', 5.0)  # how often to log FK
 
         self.radius = float(self.get_parameter('radius').value)
