@@ -120,7 +120,7 @@
         <pose>0 0 0.09 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.03 0.03 0.18</size>
+            <size>0.03 0.03 0.15</size>
           </box>
         </geometry>
       </visual>
@@ -146,7 +146,7 @@
     </joint>
 
     <link name='link2'>
-      <pose relative_to='joint2'>0 0 0 0 0 0</pose>
+      <pose relative_to='joint2'>0 0 0 0 2.618 0</pose>
       <inertial>
         <mass>0.0001</mass>
         <inertia>
@@ -162,7 +162,7 @@
         <pose>0 0 0.09 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.03 0.03 0.18</size>
+            <size>0.03 0.03 0.13</size>
           </box>
         </geometry>
       </visual>
