@@ -23,8 +23,8 @@ class InverseKinematics(Node):
         self.l2 = 0.1383
 
         # circle params
-        self.cx = 0.0
-        self.cy = -0.15
+        self.cx = -0.10
+        self.cy = 0.15
         self.r = 0.05
 
         self.speed = 1.0  # radians/sec
@@ -54,8 +54,8 @@ class InverseKinematics(Node):
         joint_1_angle = math.atan2(y, x) - math.atan2(k2, k1)
 
         # --- your calibration offsets ---
-        joint_1_deg = math.degrees(joint_1_angle) + 270  # 180 + 90
-        joint_2_deg = math.degrees(joint_2_angle) + 180
+        joint_1_deg = math.degrees(joint_1_angle)
+        joint_2_deg = math.degrees(joint_2_angle)
 
         msg = Float64MultiArray()
         msg.data = [joint_1_deg, joint_2_deg]

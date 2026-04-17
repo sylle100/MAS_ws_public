@@ -5,6 +5,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from dynamixel_sdk import *
 import math
+import numpy as np
 
 # ---------------- DYNAMIXEL SETUP ----------------
 TORQUE_ADDR = 64
@@ -90,7 +91,7 @@ class CombinedDynamixelController(Node):
             m2 = 315 + roll
 
             # Clamp
-            m1 = max(275, min(345, m1))
+            m1 = max(295, min(335, m1))
             m2 = max(275, min(345, m2))
 
             self.gimbal_positions = [m1, m2]
@@ -100,21 +101,23 @@ class CombinedDynamixelController(Node):
 
     def arm_callback(self, msg):
         if len(msg.data) >= 2:
-            joint1 = rad_to_deg(msg.data[0])
-            joint2 = rad_to_deg(msg.data[1])
+            # Convert radians → degrees
+            joint1_deg = msg.data[0]
+            joint2_deg = msg.data[1]
 
-            # Map to motors 3,4
-            m3 = 180#joint1
-            m4 = 180#joint2
-
-            # Clamp
-            m3 = max(90, min(270, m3))
-            m4 = max(0, min(360, m4))
+            # Map to Dynamixel range (center = 180°)
+            m3 = joint1_deg
+            m4 = joint2_deg
 
             self.arm_positions = [m3, m4]
 
+            self.get_logger().info(
+                f"Arm cmd → rad: [{msg.data[0]:.2f}, {msg.data[1]:.2f}] "
+                f"deg: [{m3:.1f}, {m4:.1f}]"
+            )
         else:
             self.get_logger().warn("Arm needs 2 joints")
+
 
     # ---------------- CONTROL LOOP ----------------
     def control_loop(self):
