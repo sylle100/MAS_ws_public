@@ -126,6 +126,7 @@ class mobilejacobian(Node):
 
         # record the starting drone position so we can return to it
         self.start_pose = None
+        self.start_ee_pose = None
 
         # Control parameters
         self.links = np.array([0.15, 0.15])
@@ -137,7 +138,7 @@ class mobilejacobian(Node):
         # null space - separate positions for start/goto, hover, and tap
         self.pose_des_goto = [0,0,0,0,np.pi - (8*np.pi)/9, np.pi/3]  # start: link1 down, link2 150 deg up
         self.pose_des_hover = [0,0,0,0,(8*np.pi)/9,np.pi/3]  # hover: link1 30 deg, link2 30 deg
-        #self.pose_des_tap = [0,0,0,0,-np.pi/3,0]  # tap: link1 down further, link2 straight (90 deg down when link1 is vertical)
+        self.pose_des_tap = [0,0,0,0,-np.pi/3,0]  # tap: link1 down further, link2 straight (90 deg down when link1 is vertical)
         self.pose_k   = [0,0,0,0,1,1]
 
         # mission phases: 'goto', 'hover', 'tap', 'return', 'done'
@@ -149,17 +150,17 @@ class mobilejacobian(Node):
         # Target sequencing
         self.target_index = 0
 
-        self.goto_timeout = 60.0  # max time to spend in goto phase before force-switching (seconds)
+        self.goto_timeout = 25.0  # max time to spend in goto phase before force-switching (seconds)
         self.hover_height = 0.2  # meters above target
         self.approach_height = 0.2  # meters above hover height for overhead approach
-        self.descend_radius_xy = 0.08  # only descend when nearly centered above the target
+        self.descend_radius_xy = 0.12  # only descend when nearly centered above the target
         self.target_avoid_radius = 0.18  # meters; protected bubble around each target
         self.target_avoid_influence = 0.35  # meters; start bending away before reaching the bubble
         self.target_avoid_gain = 0.25  # m/s of repulsive task-space velocity at the bubble edge
         self.hover_duration = 2.0  # seconds
-        self.tap_depth = 0.15  # meters to lower end effector for tapping
+        self.tap_depth = 0.22  # meters to lower end effector for tapping
         self.tap_duration = 1.0  # seconds to spend tapping
-        self.arrival_threshold = 0.05  # meters, to consider "arrived" at a point (for phase switching)
+        self.arrival_threshold = 0.10  # meters, to consider "arrived" at a point (for phase switching)
 
         # Optitrack area boundaries (from optitrack.world) with safety margins
         self.optitrack_x_min = -5.8
@@ -199,6 +200,13 @@ class mobilejacobian(Node):
     def end_effector_callback(self, msg: Odometry):
         self.end_effector_pose = msg.pose.pose
         self.end_effector_twist = msg.twist.twist
+        if self.start_ee_pose is None:
+            self.start_ee_pose = np.array([
+                self.end_effector_pose.position.x,
+                self.end_effector_pose.position.y,
+                self.end_effector_pose.position.z,
+            ])
+            self.get_logger().info(f"Recorded start end-effector pose: {self.start_ee_pose}")
 
     def imu_callback(self, msg: Imu):
         quat = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
@@ -315,9 +323,13 @@ class mobilejacobian(Node):
             return hover_pos
 
         if self.phase == 'return':
+            if self.start_ee_pose is not None:
+                return self.start_ee_pose.copy()
             return self.start_pose
 
         # done
+        if self.start_ee_pose is not None:
+            return self.start_ee_pose.copy()
         return self.start_pose
 
     def _compute_target_avoidance_velocity(self, current_pos: np.ndarray) -> np.ndarray:
@@ -510,6 +522,8 @@ class mobilejacobian(Node):
         # q dot
         if self.phase == 'done':
             q_dot = np.zeros((6, 1))
+            if self.start_pose is not None:
+                self.setpoint_pose = self.start_pose.copy()
         else:
             q_dot = q_task + q_null
 
