@@ -98,14 +98,22 @@ class DroneCircle(Node):
         self.circle_angular_speed = 0.20  # rad/s
         self.transition_duration = 3.0
         self.max_yaw_rate = 0.8  # rad/s
-        self.position_gain = 0.8
-        self.max_linear_speed = 0.8
+        self.position_gain = 0.3  # Reduced from 0.8 for smoother, safer control
+        self.max_linear_speed = 0.5  # Reduced from 0.8 for safety
         self.goto_tolerance = 0.15
         self.flight_phase = "goto"
         self.circle_angle = 0.0
         self.transition_time = 0.0
         self.transition_radius = 0.0
         self.goto_target = self.circle_center.copy()
+        
+        # OptiTrack workspace boundaries for safety
+        self.optitrack_x_min = -5.8
+        self.optitrack_x_max = 5.8
+        self.optitrack_y_min = -5.8
+        self.optitrack_y_max = 5.8
+        self.optitrack_z_min = 0.2  # Safe margin above ground
+        self.optitrack_z_max = 5.3  # Below ceiling
 
         # null space
         self.pose_des = [0, 0, 0, 0, 0, math.pi / 2]
@@ -220,6 +228,13 @@ class DroneCircle(Node):
         yaw_step = max(-max_step, min(max_step, yaw_error))
         self.setpoint_yaw = self.wrap_angle(self.setpoint_yaw + yaw_step)
 
+    def clamp_position_to_workspace(self, pos):
+        """Clamp position to OptiTrack workspace boundaries."""
+        pos[0] = max(self.optitrack_x_min, min(self.optitrack_x_max, pos[0]))
+        pos[1] = max(self.optitrack_y_min, min(self.optitrack_y_max, pos[1]))
+        pos[2] = max(self.optitrack_z_min, min(self.optitrack_z_max, pos[2]))
+        return pos
+
     def update_drone_trajectory(self, dt: float):
         if self.flight_phase == "goto":
             position_error = [
@@ -233,6 +248,8 @@ class DroneCircle(Node):
                 self.drone_pose[i] + velocity_cmd[i] * dt
                 for i in range(3)
             ]
+            # Clamp to workspace boundaries to prevent flying out of OptiTrack range
+            self.setpoint_pose = self.clamp_position_to_workspace(self.setpoint_pose)
             self.setpoint_pose[2] = max(self.setpoint_pose[2], self.min_goto_height)
 
             if math.sqrt(sum(component * component for component in position_error)) < self.goto_tolerance:
@@ -275,6 +292,8 @@ class DroneCircle(Node):
             self.circle_center[1] + self.circle_radius * math.sin(self.circle_angle),
             self.circle_center[2],
         ]
+        # Clamp to workspace as extra safety measure
+        self.setpoint_pose = self.clamp_position_to_workspace(self.setpoint_pose)
 
         tangent_yaw = self.circle_angle + (math.pi / 2.0)
         self.update_setpoint_yaw(tangent_yaw, dt)
@@ -286,10 +305,17 @@ class DroneCircle(Node):
         self.last_time = now
 
         if self.setpoint_pose is None:
+            self.get_logger().warn("Waiting for initial drone position from /mavros/local_position/pose")
+            return
+        
+        if not self.local_pose_received:
+            self.get_logger().warn("Drone position not yet received from OptiTrack")
             return
 
         dt = max(dt, 1e-3)
         self.update_drone_trajectory(dt)
+        # Final safety clamp to workspace boundaries
+        self.setpoint_pose = self.clamp_position_to_workspace(self.setpoint_pose)
         self.setpoint_pose[2] = min(max(self.setpoint_pose[2], 0.1), self.max_height)
 
         self.publish_setpoint()
