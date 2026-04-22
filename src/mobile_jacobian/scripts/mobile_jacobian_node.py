@@ -135,8 +135,8 @@ class mobilejacobian(Node):
         self.min_z = 0.1  # minimum allowed altitude for commanded setpoint (meters)
 
         # null space - separate positions for start/goto, hover, and tap
-        self.pose_des_goto = [0,0,0,0,np.pi - (np.pi/6), np.pi/6]  # start: link1 down, link2 150 deg up
-        self.pose_des_hover = [0,0,0,0,np.pi - (np.pi/6),np.pi/6]  # hover: link1 30 deg, link2 30 deg
+        self.pose_des_goto = [0,0,0,0,np.pi - (8*np.pi)/9, np.pi/3]  # start: link1 down, link2 150 deg up
+        self.pose_des_hover = [0,0,0,0,(8*np.pi)/9,np.pi/3]  # hover: link1 30 deg, link2 30 deg
         #self.pose_des_tap = [0,0,0,0,-np.pi/3,0]  # tap: link1 down further, link2 straight (90 deg down when link1 is vertical)
         self.pose_k   = [0,0,0,0,1,1]
 
