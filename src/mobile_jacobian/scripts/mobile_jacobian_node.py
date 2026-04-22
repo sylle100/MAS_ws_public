@@ -108,6 +108,11 @@ class mobilejacobian(Node):
             Float64MultiArray,
             '/arm_controller/commands',
             10)
+
+        self.gimbal_pub = self.create_publisher(
+            Float64MultiArray,
+            '/gimbal_controller/commands',
+            10)
         
 
 
@@ -116,37 +121,53 @@ class mobilejacobian(Node):
         self.yaw = 0
         self.setpoint_yaw = 0
         self.joint_pose = [0,0]
+        self.gimbal_pitch = 0.0  # radians, positive = tilt up
+        self.gimbal_roll = 0.0   # radians, positive = tilt right
 
         # record the starting drone position so we can return to it
         self.start_pose = None
 
         # Control parameters
         self.links = np.array([0.15, 0.15])
-        self.k = 0.6
+        self.k = 0.3
 
         # Safety limits
         self.min_z = 0.1  # minimum allowed altitude for commanded setpoint (meters)
 
-        # null space
-        self.pose_des = [0,0,0,0,0,np.pi/2]
+        # null space - separate positions for start/goto, hover, and tap
+        self.pose_des_goto = [0,0,0,0,np.pi - (8*np.pi)/9, np.pi/3]  # start: link1 down, link2 150 deg up
+        self.pose_des_hover = [0,0,0,0,(8*np.pi)/9,np.pi/3]  # hover: link1 30 deg, link2 30 deg
+        #self.pose_des_tap = [0,0,0,0,-np.pi/3,0]  # tap: link1 down further, link2 straight (90 deg down when link1 is vertical)
         self.pose_k   = [0,0,0,0,1,1]
 
-        # mission phases: 'goto', 'hover', 'return', 'done'
+        # mission phases: 'goto', 'hover', 'tap', 'return', 'done'
         self.phase = 'goto'
         self.phase_start_time = time.time()
         self.hover_start_time = None
+        self.tap_start_time = None
 
         # Target sequencing
         self.target_index = 0
 
+        self.goto_timeout = 60.0  # max time to spend in goto phase before force-switching (seconds)
         self.hover_height = 0.2  # meters above target
         self.approach_height = 0.2  # meters above hover height for overhead approach
         self.descend_radius_xy = 0.08  # only descend when nearly centered above the target
         self.target_avoid_radius = 0.18  # meters; protected bubble around each target
         self.target_avoid_influence = 0.35  # meters; start bending away before reaching the bubble
         self.target_avoid_gain = 0.25  # m/s of repulsive task-space velocity at the bubble edge
-        self.hover_duration = 5.0  # seconds
+        self.hover_duration = 2.0  # seconds
+        self.tap_depth = 0.15  # meters to lower end effector for tapping
+        self.tap_duration = 1.0  # seconds to spend tapping
         self.arrival_threshold = 0.05  # meters, to consider "arrived" at a point (for phase switching)
+
+        # Optitrack area boundaries (from optitrack.world) with safety margins
+        self.optitrack_x_min = -5.8
+        self.optitrack_x_max = 5.8
+        self.optitrack_y_min = -5.8
+        self.optitrack_y_max = 5.8
+        self.optitrack_z_min = 0.1   # min altitude
+        self.optitrack_z_max = 5.5   # max altitude (below ceiling)
 
         # For integration of velocity commands
         self.last_time = self.get_clock().now()
@@ -236,6 +257,14 @@ class mobilejacobian(Node):
         delta = q_dot - self.last_q_dot
         return self.last_q_dot + np.clip(delta, -max_delta, max_delta)
 
+    def _clamp_to_optitrack_bounds(self, pos: np.ndarray) -> np.ndarray:
+        """Clamp position to stay within optitrack area boundaries."""
+        pos_clamped = pos.copy()
+        pos_clamped[0] = np.clip(pos_clamped[0], self.optitrack_x_min, self.optitrack_x_max)
+        pos_clamped[1] = np.clip(pos_clamped[1], self.optitrack_y_min, self.optitrack_y_max)
+        pos_clamped[2] = np.clip(pos_clamped[2], self.optitrack_z_min, self.optitrack_z_max)
+        return pos_clamped
+
     def _compute_desired_position(self) -> np.ndarray:
         """Compute the desired drone position for the current mission phase."""
 
@@ -243,7 +272,7 @@ class mobilejacobian(Node):
         if self.start_pose is None:
             return np.array(self.drone_pose)
 
-        if self.phase in ('goto', 'hover'):
+        if self.phase in ('goto', 'hover', 'tap'):
             # Skip targets that haven't been received yet.
             while self.target_index < len(self.targets) and not self.targets_received[self.target_index]:
                 self.get_logger().info(f"Skipping target {self.target_index + 1}: no data received")
@@ -257,7 +286,17 @@ class mobilejacobian(Node):
             hover_pos[2] = max(target[2] + self.hover_height, self.min_z)
 
             if self.phase == 'hover':
+                self.get_logger().info(f"HOVER: Target={target}, hover_pos_Z={hover_pos[2]:.3f}, EE_Z={self.end_effector_pose.position.z:.3f}")
                 return hover_pos
+            
+            if self.phase == 'tap':
+                # During tap, lower the end effector to actually contact the target
+                # tap_depth is how much to lower BELOW hover height
+                tap_pos = hover_pos.copy()
+                tap_pos[2] = hover_pos[2] - self.tap_depth  # Lower from hover height
+                tap_pos[2] = max(tap_pos[2], self.min_z)  # But don't go below minimum altitude
+                self.get_logger().warn(f"TAP DESIRED: hover_Z={hover_pos[2]:.3f}, tap_pos_Z={tap_pos[2]:.3f}, EE_Z={self.end_effector_pose.position.z:.3f}")
+                return tap_pos
 
             current_pos = np.array([
                 self.end_effector_pose.position.x,
@@ -299,7 +338,7 @@ class mobilejacobian(Node):
             if xy_dist >= self.target_avoid_influence:
                 continue
 
-            active_target = idx == self.target_index and self.phase in ('goto', 'hover')
+            active_target = idx == self.target_index and self.phase in ('goto', 'hover', 'tap')
             if active_target and current_pos[2] >= safe_overhead_z - self.arrival_threshold:
                 # Once we are safely overhead, allow the vertical approach.
                 continue
@@ -328,17 +367,58 @@ class mobilejacobian(Node):
 
         return avoid
 
+    def _compute_gimbal_angles(self):
+        """Compute gimbal pitch and roll based on mission phase.
+        
+        During tap phase, point gimbal down at the target.
+        Otherwise, keep gimbal level.
+        """
+        if self.phase == 'tap' and self.target_index < len(self.targets):
+            # Point gimbal down at the target during tap
+            current_pos = np.array([
+                self.end_effector_pose.position.x,
+                self.end_effector_pose.position.y,
+                self.end_effector_pose.position.z,
+            ])
+            target = self.targets[self.target_index]
+            
+            # Compute angle to target
+            delta = target - current_pos
+            distance = np.linalg.norm(delta)
+            
+            if distance > 0.01:
+                # Pitch: look down at target (negative pitch = look down)
+                self.gimbal_pitch = -np.arctan2(delta[2], np.sqrt(delta[0]**2 + delta[1]**2))
+                # Roll: keep level
+                self.gimbal_roll = 0.0
+            else:
+                # Very close to target, point straight down
+                self.gimbal_pitch = -np.pi / 2  # -90 degrees
+                self.gimbal_roll = 0.0
+        else:
+            # Keep gimbal level during other phases
+            self.gimbal_pitch = 0.0
+            self.gimbal_roll = 0.0
+
     def get_v(self):
         """Desired null space"""
         (t0,t1) = self.joint_pose
+        
+        # Select arm position based on mission phase
+        if self.phase == 'hover':
+            pose_des = self.pose_des_hover
+        elif self.phase == 'tap':
+            pose_des = self.pose_des_tap
+        else:
+            pose_des = self.pose_des_goto
         
         v = np.array([
             [self.pose_k[0] * 0],
             [self.pose_k[1] * 0],
             [self.pose_k[2] * 0],
             [self.pose_k[3] * 0],
-            [self.pose_k[4] * (self.pose_des[4] - t0)],
-            [self.pose_k[5] * (self.pose_des[5] - t1)]
+            [self.pose_k[4] * (pose_des[4] - t0)],
+            [self.pose_k[5] * (pose_des[5] - t1)]
             ])
         return v
 
@@ -365,25 +445,50 @@ class mobilejacobian(Node):
         if self.phase == 'goto' and dist < self.arrival_threshold:
             self.phase = 'hover'
             self.hover_start_time = time.time()
-            self.get_logger().info('Reached target; hovering for %.1fs' % self.hover_duration)
+            self.get_logger().info(f'Reached target; EE_pos={current_pos}, desired_pos={desired_pos}, dist={dist:.3f}; hovering for %.1fs' % self.hover_duration)
+        
+        # Fallback: if in goto phase too long, force go to hover anyway
+        if self.phase == 'goto':
+            goto_elapsed = time.time() - self.phase_start_time
+            if goto_elapsed >= self.goto_timeout:
+                self.get_logger().warn(f"Goto timeout ({goto_elapsed:.1f}s) reached! Forcing hover phase.")
+                self.phase = 'hover'
+                self.hover_start_time = time.time()
 
         if self.phase == 'hover':
-            elapsed = time.time() - self.hover_start_time
-            if elapsed >= self.hover_duration:
-                # Move to the next target, or return home if done.
-                self.target_index += 1
-                while self.target_index < len(self.targets) and not self.targets_received[self.target_index]:
-                    self.get_logger().info(f"Skipping target {self.target_index + 1}: no data received")
-                    self.target_index += 1
+            if self.hover_start_time is not None:
+                elapsed = time.time() - self.hover_start_time
+                if elapsed >= self.hover_duration:
+                    self.get_logger().warn(f"HOVER COMPLETE! Transitioning to TAP phase. (elapsed={elapsed:.2f}s)")
+                    self.phase = 'tap'
+                    self.tap_start_time = time.time()
+                elif int(elapsed) % 1 == 0:  # Log every 1 second
+                    self.get_logger().info(f"HOVER phase: elapsed={elapsed:.2f}s / {self.hover_duration}s, dist_to_target={dist:.3f}m")
+            else:
+                self.get_logger().warn("HOVER phase but hover_start_time is None!")
 
-                if self.target_index < len(self.targets):
-                    self.phase = 'goto'
-                    self.phase_start_time = time.time()
-                    self.get_logger().info(f"Hover complete; going to target {self.target_index + 1}")
-                else:
-                    self.phase = 'return'
-                    self.phase_start_time = time.time()
-                    self.get_logger().info('Hover complete; returning to start')
+        if self.phase == 'tap':
+            if self.tap_start_time is not None:
+                elapsed = time.time() - self.tap_start_time
+                self.get_logger().warn(f"TAP phase: elapsed={elapsed:.2f}s / {self.tap_duration}s, EE_Z={current_pos[2]:.3f}m, desired_Z={desired_pos[2]:.3f}m")
+                if elapsed >= self.tap_duration:
+                    self.get_logger().warn(f"TAP COMPLETE! Moving to next target.")
+                    # Move to the next target, or return home if done.
+                    self.target_index += 1
+                    while self.target_index < len(self.targets) and not self.targets_received[self.target_index]:
+                        self.get_logger().info(f"Skipping target {self.target_index + 1}: no data received")
+                        self.target_index += 1
+
+                    if self.target_index < len(self.targets):
+                        self.phase = 'goto'
+                        self.phase_start_time = time.time()
+                        self.get_logger().info(f"Going to target {self.target_index + 1}")
+                    else:
+                        self.phase = 'return'
+                        self.phase_start_time = time.time()
+                        self.get_logger().info('All targets tapped; returning to start')
+            else:
+                self.get_logger().warn("TAP phase but tap_start_time is None!")
 
         if self.phase == 'return' and dist < self.arrival_threshold:
             self.phase = 'done'
@@ -433,8 +538,8 @@ class mobilejacobian(Node):
         self.setpoint_pose[2] += q_dot[2][0] * dt
         self.setpoint_yaw += q_dot[3][0] * dt
 
-        # Safety: don't command below the minimum allowed altitude
-        self.setpoint_pose[2] = max(self.setpoint_pose[2], self.min_z)
+        # Safety: clamp to optitrack bounds and don't command below the minimum allowed altitude
+        self.setpoint_pose = self._clamp_to_optitrack_bounds(self.setpoint_pose)
 
 
         # velocity bases
@@ -456,8 +561,11 @@ class mobilejacobian(Node):
         cmd.pose.orientation = Quaternion(x = Q[0], y = Q[1], z = Q[2], w = Q[3])
         self.drone_pos_pub.publish(cmd)
 
-
-
+        # Compute and publish gimbal commands
+        self._compute_gimbal_angles()
+        cmd_gimbal = Float64MultiArray()
+        cmd_gimbal.data = [-self.gimbal_pitch, -self.gimbal_roll]
+        self.gimbal_pub.publish(cmd_gimbal)
 
         # update arm joint position based on velosity
         t0 = self.joint_pose[0] + q_dot[4][0] * dt
