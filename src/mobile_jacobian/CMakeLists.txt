@@ -6,8 +6,14 @@ find_package(rclpy REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(action_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 
-ament_python_install_package(${PROJECT_NAME})
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "action/SwitchTarget.action"
+  DEPENDENCIES action_msgs builtin_interfaces
+)
 
 install(
   PROGRAMS
@@ -20,4 +26,5 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()

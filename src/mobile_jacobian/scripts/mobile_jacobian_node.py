@@ -1,235 +1,296 @@
 #!/usr/bin/env python3
 
-import rclpy
-from rclpy.node import Node
-from rclpy.action import ActionServer
-from sensor_msgs.msg import JointState, Imu
-from std_msgs.msg import Float64MultiArray
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Twist, Quaternion, Vector3
-from geometry_msgs.msg import PoseStamped
-from rclpy.qos import ReliabilityPolicy, QoSProfile
-
-import numpy as np
-import functools
-
-from mobile_jacobian.orientation_funcs import euler_from_quaternion, quaternion_from_euler
-from mobile_jacobian.jacobian_math import JMoore, J_mobile, Jinv
-
-from mavros.base import SENSOR_QOS
+import math
+import threading
 import time
 
-
-# Action stuff
+import numpy as np
+import rclpy
+from geometry_msgs.msg import PoseStamped, Quaternion, Twist
+from nav_msgs.msg import Odometry
 from rclpy.action import ActionServer
-# from mission.mission_manager import MissionManager # TODO: See this again - might want to link to the action file
-# from mission.mission_manager.action import mission
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Float64MultiArray
 
-class mobilejacobian(Node):
+from mobile_jacobian.action import SwitchTarget
+from mobile_jacobian.jacobian_math import J_mobile, JMoore
+from mobile_jacobian.orientation_funcs import euler_from_quaternion, quaternion_from_euler
+
+from mavros.base import SENSOR_QOS
+
+
+class MobileJacobian(Node):
     def __init__(self):
         super().__init__('mobile_jacobian')
-        self.get_logger().info("mobile_jacobian node started")
+        self.get_logger().info('mobile_jacobian node started')
 
-        self.drone_pos_sub = self.create_subscription(
-            PoseStamped,                    # Topic type
-            '/mavros/local_position/pose',  # Topic name
-            self.drone_pos_callback,        # Runs the function
-            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)                               # QoS depth
-        )
-        
-        self.sub_pos_angle = self.create_subscription(
-            JointState,                 # Topic type
-            '/joint_states',            # Topic name
-            self.joint_state_callback,  # Runs the function
-            10                          # QoS depth
-        )
-        
-        self.end_effector_sub = self.create_subscription(
-            Odometry,
-            "/end_effector/pose",
-            self.end_effector_callback,
-            10
-        )
+        self.action_group = ReentrantCallbackGroup()
+        self.state_lock = threading.Lock()
+
+        self.expected_joint_names = ['joint1', 'joint2']
+        self.use_degrees_for_gimbal = True
+        self.command_frame = None
+        self.last_hover_log_second = -1
+        self.frame_warnings_issued = set()
+
+        self.have_pose = False
+        self.have_imu = False
+        self.have_joint_state = False
+        self.have_ee_pose = False
+
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+        self.drone_pose = np.zeros(3, dtype=float)
+        self.setpoint_pose = None
+        self.setpoint_yaw = 0.0
+        self.joint_pose = [0.0, 0.0]
+        self.gimbal_pitch = 0.0
+        self.gimbal_roll = 0.0
+        self.start_pose = None
+        self.start_ee_pose = None
         self.end_effector_pose = Odometry().pose.pose
         self.end_effector_twist = Twist()
+        self.orientation = Quaternion()
+
+        self.current_goal_handle = None
+        self.current_goal_target_index = None
+
+        self.drone_pos_sub = self.create_subscription(
+            PoseStamped,
+            '/mavros/local_position/pose',
+            self.drone_pos_callback,
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
+
+        self.sub_pos_angle = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self.joint_state_callback,
+            10,
+        )
+
+        self.end_effector_sub = self.create_subscription(
+            Odometry,
+            '/end_effector/pose',
+            self.end_effector_callback,
+            10,
+        )
 
         self.imu_sub = self.create_subscription(
             Imu,
-            "/mavros/imu/data",
+            '/mavros/imu/data',
             self.imu_callback,
-            qos_profile=SENSOR_QOS
+            qos_profile=SENSOR_QOS,
         )
-        self.orientation = Quaternion()
 
-        # Targets for the end-effector to reach (3D points).
-        # Each subscription updates one of these 4 targets.
         self.targets = [np.zeros(3) for _ in range(4)]
         self.targets_received = [False] * 4
 
-        self.create_subscription(
-            Odometry,
-            "/target1/pose",
-            lambda msg, idx=0: self.target_callback(msg, idx),
-            10
-        )
+        self.create_subscription(Odometry, '/target1/pose', lambda msg, idx=0: self.target_callback(msg, idx), 10)
+        self.create_subscription(Odometry, '/target2/pose', lambda msg, idx=1: self.target_callback(msg, idx), 10)
+        self.create_subscription(Odometry, '/target3/pose', lambda msg, idx=2: self.target_callback(msg, idx), 10)
+        self.create_subscription(Odometry, '/target4/pose', lambda msg, idx=3: self.target_callback(msg, idx), 10)
 
-        self.create_subscription(
-            Odometry,
-            "/target2/pose",
-            lambda msg, idx=1: self.target_callback(msg, idx),
-            10
-        )
+        self.drone_pos_pub = self.create_publisher(PoseStamped, '/mavros/setpoint_position/local', 10)
+        self.drone_vel_pub = self.create_publisher(Twist, '/mavros/setpoint_velocity/cmd_vel_unstamped', 10)
+        self.arm_pub = self.create_publisher(Float64MultiArray, '/arm_controller/commands', 10)
+        self.gimbal_pub = self.create_publisher(Float64MultiArray, '/gimbal_controller/commands', 10)
 
-        self.create_subscription(
-            Odometry,
-            "/target3/pose",
-            lambda msg, idx=2: self.target_callback(msg, idx),
-            10
-        )
-
-        self.create_subscription(
-            Odometry,
-            "/target4/pose",
-            lambda msg, idx=3: self.target_callback(msg, idx),
-            10
-        )
-
-        self.drone_pos_pub = self.create_publisher(
-            PoseStamped,
-            "/mavros/setpoint_position/local",
-            10)
-
-        self.drone_vel_pub = self.create_publisher(
-            Twist,
-            "/mavros/setpoint_velocity/cmd_vel_unstamped",
-            10)
-        
-        self.arm_pub = self.create_publisher(
-            Float64MultiArray,
-            '/arm_controller/commands',
-            10)
-
-        self.gimbal_pub = self.create_publisher(
-            Float64MultiArray,
-            '/gimbal_controller/commands',
-            10)
-        
-
-
-        self.drone_pose = [0,0,0]
-        self.setpoint_pose = None
-        self.yaw = 0
-        self.setpoint_yaw = 0
-        self.joint_pose = [0,0]
-        self.gimbal_pitch = 0.0  # radians, positive = tilt up
-        self.gimbal_roll = 0.0   # radians, positive = tilt right
-
-        # record the starting drone position so we can return to it
-        self.start_pose = None
-        self.start_ee_pose = None
-
-        # Control parameters
         self.links = np.array([0.15, 0.15])
         self.k = 0.3
+        self.min_z = 0.1
 
-        # Safety limits
-        self.min_z = 0.1  # minimum allowed altitude for commanded setpoint (meters)
+        self.pose_des_goto = [0, 0, 0, 0, np.pi - (8 * np.pi) / 9, np.pi / 3]
+        self.pose_des_hover = [0, 0, 0, 0, (8 * np.pi) / 9, np.pi / 3]
+        self.pose_des_tap = [0, 0, 0, 0, -np.pi / 3, 0]
+        self.pose_k = [0, 0, 0, 0, 1, 1]
 
-        # null space - separate positions for start/goto, hover, and tap
-        self.pose_des_goto = [0,0,0,0,np.pi - (8*np.pi)/9, np.pi/3]  # start: link1 down, link2 150 deg up
-        self.pose_des_hover = [0,0,0,0,(8*np.pi)/9,np.pi/3]  # hover: link1 30 deg, link2 30 deg
-        self.pose_des_tap = [0,0,0,0,-np.pi/3,0]  # tap: link1 down further, link2 straight (90 deg down when link1 is vertical)
-        self.pose_k   = [0,0,0,0,1,1]
-
-        # mission phases: 'goto', 'hover', 'tap', 'return', 'done'
         self.phase = 'goto'
         self.phase_start_time = time.time()
         self.hover_start_time = None
         self.tap_start_time = None
-
-        # Target sequencing
         self.target_index = 0
 
-        self.goto_timeout = 25.0  # max time to spend in goto phase before force-switching (seconds)
-        self.hover_height = 0.2  # meters above target
-        self.approach_height = 0.2  # meters above hover height for overhead approach
-        self.descend_radius_xy = 0.12  # only descend when nearly centered above the target
-        self.target_avoid_radius = 0.18  # meters; protected bubble around each target
-        self.target_avoid_influence = 0.35  # meters; start bending away before reaching the bubble
-        self.target_avoid_gain = 0.25  # m/s of repulsive task-space velocity at the bubble edge
-        self.hover_duration = 2.0  # seconds
-        self.tap_depth = 0.22  # meters to lower end effector for tapping
-        self.tap_duration = 1.0  # seconds to spend tapping
-        self.arrival_threshold = 0.10  # meters, to consider "arrived" at a point (for phase switching)
+        self.goto_timeout = 25.0
+        self.hover_height = 0.2
+        self.approach_height = 0.2
+        self.descend_radius_xy = 0.12
+        self.target_avoid_radius = 0.30  # increased from 0.18
+        self.target_avoid_influence = 0.60  # increased from 0.35  
+        self.target_avoid_gain = 0.40  # increased from 0.25
+        self.hover_duration = 2.0
+        self.tap_depth = 0.22
+        self.tap_duration = 1.0
+        self.arrival_threshold = 0.10
 
-        # Optitrack area boundaries (from optitrack.world) with safety margins
         self.optitrack_x_min = -5.8
         self.optitrack_x_max = 5.8
         self.optitrack_y_min = -5.8
         self.optitrack_y_max = 5.8
-        self.optitrack_z_min = 0.1   # min altitude
-        self.optitrack_z_max = 5.5   # max altitude (below ceiling)
+        self.optitrack_z_min = 0.1
+        self.optitrack_z_max = 5.5
 
-        # For integration of velocity commands
         self.last_time = self.get_clock().now()
 
-        # Limits for commanded velocities
-        self.max_linear_vel = 0.3  # m/s
-        self.max_angular_vel = 0.6  # rad/s
-        self.max_joint_vel = 0.6  # rad/s
-        self.max_linear_acc = 0.5  # m/s^2
-        self.max_angular_acc = 0.8  # rad/s^2
-        self.max_joint_acc = 1.0  # rad/s^2
-        self.approach_smoothing = 0.25  # meters; larger values soften long moves
+        self.max_linear_vel = 0.3
+        self.max_angular_vel = 0.6
+        self.max_joint_vel = 0.6
+        self.max_linear_acc = 0.5
+        self.max_angular_acc = 0.8
+        self.max_joint_acc = 1.0
+        self.approach_smoothing = 0.25
         self.last_q_dot = np.zeros((6, 1))
 
-        self.timer = self.create_timer(.1, self.timer_callback)
+        self.joint_min = np.array([-np.pi, -np.pi])
+        self.joint_max = np.array([np.pi, np.pi])
+
+        self.switch_target_action_server = ActionServer(
+            self,
+            SwitchTarget,
+            'switch_target',
+            self.execute_callback,
+            callback_group=self.action_group,
+        )
+
+        self.timer = self.create_timer(0.1, self.timer_callback)
+
+    def _warn_frame_once(self, label: str, frame_id: str):
+        key = (label, frame_id)
+        if key in self.frame_warnings_issued:
+            return
+        self.frame_warnings_issued.add(key)
+        self.get_logger().warn(
+            f'{label} frame_id={frame_id!r}. Verify all pose topics share a compatible world frame.'
+        )
+
+    def _validate_target(self, target: np.ndarray) -> bool:
+        if not np.all(np.isfinite(target)):
+            self.get_logger().warn(f'Rejecting invalid target (non-finite values): {target}')
+            return False
+
+        if not (
+            self.optitrack_x_min <= target[0] <= self.optitrack_x_max
+            and self.optitrack_y_min <= target[1] <= self.optitrack_y_max
+            and self.optitrack_z_min <= target[2] <= self.optitrack_z_max
+        ):
+            self.get_logger().warn(
+                'Rejecting out-of-bounds target '
+                f'{target}; bounds x=[{self.optitrack_x_min}, {self.optitrack_x_max}], '
+                f'y=[{self.optitrack_y_min}, {self.optitrack_y_max}], '
+                f'z=[{self.optitrack_z_min}, {self.optitrack_z_max}]'
+            )
+            return False
+
+        return True
+
+    def _all_required_state_ready(self) -> bool:
+        return self.have_pose and self.have_imu and self.have_joint_state and self.have_ee_pose
+
+    def _wrap_angle(self, angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     def target_callback(self, msg, index):
-        p = msg.pose.pose
-        self.targets[index] = np.array([p.position.x, p.position.y, p.position.z])
-        if not self.targets_received[index]:
+        target = np.array([
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            msg.pose.pose.position.z,
+        ], dtype=float)
+
+        if msg.header.frame_id:
+            self._warn_frame_once(f'target{index + 1}', msg.header.frame_id)
+
+        if not self._validate_target(target):
+            return
+
+        with self.state_lock:
+            self.targets[index] = target
+            first_time = not self.targets_received[index]
             self.targets_received[index] = True
-            self.get_logger().info(f"Received target {index + 1}: {self.targets[index]}")
-    
+
+        if first_time:
+            self.get_logger().info(f'Received target {index + 1}: {target}')
+
     def joint_state_callback(self, msg: JointState):
-        t0 = msg.position[0]
-        t1 = msg.position[1]
-        self.joint_pose = [t0, t1]
+        if len(msg.position) < 2:
+            self.get_logger().warn('Received JointState with fewer than 2 positions; ignoring message')
+            return
+
+        if msg.name and all(name in msg.name for name in self.expected_joint_names):
+            name_to_idx = {name: idx for idx, name in enumerate(msg.name)}
+            t0 = msg.position[name_to_idx[self.expected_joint_names[0]]]
+            t1 = msg.position[name_to_idx[self.expected_joint_names[1]]]
+        else:
+            if msg.name and set(self.expected_joint_names) - set(msg.name):
+                self.get_logger().warn(
+                    f'Expected joints {self.expected_joint_names}, got {list(msg.name)}; falling back to first two positions'
+                )
+            t0 = msg.position[0]
+            t1 = msg.position[1]
+
+        if not (math.isfinite(t0) and math.isfinite(t1)):
+            self.get_logger().warn('Received non-finite joint state values; ignoring message')
+            return
+
+        with self.state_lock:
+            self.joint_pose = [float(t0), float(t1)]
+            self.have_joint_state = True
 
     def end_effector_callback(self, msg: Odometry):
+        if msg.header.frame_id:
+            self._warn_frame_once('end_effector', msg.header.frame_id)
+
         self.end_effector_pose = msg.pose.pose
         self.end_effector_twist = msg.twist.twist
+        self.have_ee_pose = True
+
         if self.start_ee_pose is None:
             self.start_ee_pose = np.array([
                 self.end_effector_pose.position.x,
                 self.end_effector_pose.position.y,
                 self.end_effector_pose.position.z,
-            ])
-            self.get_logger().info(f"Recorded start end-effector pose: {self.start_ee_pose}")
+            ], dtype=float)
+            self.get_logger().info(f'Recorded start end-effector pose: {self.start_ee_pose}')
 
     def imu_callback(self, msg: Imu):
         quat = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
+        if not all(math.isfinite(v) for v in quat):
+            self.get_logger().warn('Received non-finite IMU quaternion; ignoring message')
+            return
         self.roll, self.pitch, self.yaw = euler_from_quaternion(quat)
+        self.have_imu = True
 
     def drone_pos_callback(self, msg: PoseStamped):
-        self.drone_pose = [msg.pose.position.x,msg.pose.position.y,msg.pose.position.z]
-        if self.setpoint_pose is None:
-            self.setpoint_pose = np.array(self.drone_pose)
+        if msg.header.frame_id:
+            self._warn_frame_once('drone_pose', msg.header.frame_id)
+            if self.command_frame is None:
+                self.command_frame = msg.header.frame_id
+
+        pose = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ], dtype=float)
+        if not np.all(np.isfinite(pose)):
+            self.get_logger().warn('Received non-finite drone pose; ignoring message')
+            return
+
+        self.drone_pose = pose
+        self.have_pose = True
+
+        if self.setpoint_pose is None and self.have_imu:
+            self.setpoint_pose = pose.copy()
             self.setpoint_yaw = self.yaw
 
         if self.start_pose is None:
-            self.start_pose = np.array(self.drone_pose)
-            self.get_logger().info(f"Recorded start pose: {self.start_pose}")
+            self.start_pose = pose.copy()
+            self.get_logger().info(f'Recorded start pose: {self.start_pose}')
 
     def get_p_dot_des(self, desired_pos: np.ndarray):
-        """Desired change in position (3x1 vector).
-
-        Args:
-            desired_pos: 3-element desired XYZ position in world frame.
-        """
-
-        # current end-effector position
         x = self.end_effector_pose.position.x
         y = self.end_effector_pose.position.y
         z = self.end_effector_pose.position.z
@@ -244,12 +305,10 @@ class mobilejacobian(Node):
         if error_norm < 1e-6:
             return np.zeros((3, 1))
 
-        # Use a smooth saturating profile so large target jumps do not create a lunge.
         speed_scale = np.tanh(error_norm / self.approach_smoothing)
         return error * (self.k * speed_scale)
 
     def _rate_limit(self, q_dot: np.ndarray, dt: float) -> np.ndarray:
-        """Limit acceleration so command changes ramp in smoothly."""
         if dt <= 0.0:
             return q_dot
 
@@ -266,7 +325,6 @@ class mobilejacobian(Node):
         return self.last_q_dot + np.clip(delta, -max_delta, max_delta)
 
     def _clamp_to_optitrack_bounds(self, pos: np.ndarray) -> np.ndarray:
-        """Clamp position to stay within optitrack area boundaries."""
         pos_clamped = pos.copy()
         pos_clamped[0] = np.clip(pos_clamped[0], self.optitrack_x_min, self.optitrack_x_max)
         pos_clamped[1] = np.clip(pos_clamped[1], self.optitrack_y_min, self.optitrack_y_max)
@@ -274,16 +332,12 @@ class mobilejacobian(Node):
         return pos_clamped
 
     def _compute_desired_position(self) -> np.ndarray:
-        """Compute the desired drone position for the current mission phase."""
-
-        # Default to start pose until we have a true starting pose.
         if self.start_pose is None:
             return np.array(self.drone_pose)
 
-        if self.phase in ('goto', 'hover', 'tap'):
-            # Skip targets that haven't been received yet.
+        if self.phase in ('goto', 'hover', 'tap', 'clear'):
             while self.target_index < len(self.targets) and not self.targets_received[self.target_index]:
-                self.get_logger().info(f"Skipping target {self.target_index + 1}: no data received")
+                self.get_logger().info(f'Skipping target {self.target_index + 1}: no data received')
                 self.target_index += 1
 
             if self.target_index >= len(self.targets):
@@ -293,17 +347,18 @@ class mobilejacobian(Node):
             hover_pos = target.copy()
             hover_pos[2] = max(target[2] + self.hover_height, self.min_z)
 
+            if self.phase == 'clear':
+                # Clear phase: go to high altitude above current position
+                clear_pos = np.array(self.drone_pose).copy()
+                clear_pos[2] = min(clear_pos[2] + 2.0, self.optitrack_z_max)  # 2m above current, within bounds
+                return clear_pos
+
             if self.phase == 'hover':
-                self.get_logger().info(f"HOVER: Target={target}, hover_pos_Z={hover_pos[2]:.3f}, EE_Z={self.end_effector_pose.position.z:.3f}")
                 return hover_pos
-            
+
             if self.phase == 'tap':
-                # During tap, lower the end effector to actually contact the target
-                # tap_depth is how much to lower BELOW hover height
                 tap_pos = hover_pos.copy()
-                tap_pos[2] = hover_pos[2] - self.tap_depth  # Lower from hover height
-                tap_pos[2] = max(tap_pos[2], self.min_z)  # But don't go below minimum altitude
-                self.get_logger().warn(f"TAP DESIRED: hover_Z={hover_pos[2]:.3f}, tap_pos_Z={tap_pos[2]:.3f}, EE_Z={self.end_effector_pose.position.z:.3f}")
+                tap_pos[2] = max(hover_pos[2] - self.tap_depth, self.min_z)
                 return tap_pos
 
             current_pos = np.array([
@@ -317,23 +372,18 @@ class mobilejacobian(Node):
             horizontal_dist = np.linalg.norm(current_pos[:2] - target[:2])
             overhead_ready = current_pos[2] >= (overhead_pos[2] - self.arrival_threshold)
 
-            # First move above the target, then descend vertically once centered.
             if horizontal_dist > self.descend_radius_xy or not overhead_ready:
                 return overhead_pos
             return hover_pos
 
         if self.phase == 'return':
-            if self.start_ee_pose is not None:
-                return self.start_ee_pose.copy()
             return self.start_pose
 
-        # done
         if self.start_ee_pose is not None:
             return self.start_ee_pose.copy()
         return self.start_pose
 
     def _compute_target_avoidance_velocity(self, current_pos: np.ndarray) -> np.ndarray:
-        """Generate a repulsive task-space velocity around targets and upward near them."""
         avoid = np.zeros((3, 1))
 
         for idx, target_received in enumerate(self.targets_received):
@@ -350,9 +400,9 @@ class mobilejacobian(Node):
             if xy_dist >= self.target_avoid_influence:
                 continue
 
-            active_target = idx == self.target_index and self.phase in ('goto', 'hover', 'tap')
-            if active_target and current_pos[2] >= safe_overhead_z - self.arrival_threshold:
-                # Once we are safely overhead, allow the vertical approach.
+            active_target = idx == self.target_index and self.phase in ('goto', 'hover', 'tap', 'clear')
+            if active_target:
+                # Don't avoid the target we're actively trying to reach
                 continue
 
             if xy_dist < 1e-6:
@@ -380,146 +430,160 @@ class mobilejacobian(Node):
         return avoid
 
     def _compute_gimbal_angles(self):
-        """Compute gimbal pitch and roll based on mission phase.
-        
-        During tap phase, point gimbal down at the target.
-        Otherwise, keep gimbal level.
-        """
-        if self.phase == 'tap' and self.target_index < len(self.targets):
-            # Point gimbal down at the target during tap
-            current_pos = np.array([
-                self.end_effector_pose.position.x,
-                self.end_effector_pose.position.y,
-                self.end_effector_pose.position.z,
-            ])
-            target = self.targets[self.target_index]
-            
-            # Compute angle to target
-            delta = target - current_pos
-            distance = np.linalg.norm(delta)
-            
-            if distance > 0.01:
-                # Pitch: look down at target (negative pitch = look down)
-                self.gimbal_pitch = -np.arctan2(delta[2], np.sqrt(delta[0]**2 + delta[1]**2))
-                # Roll: keep level
-                self.gimbal_roll = 0.0
-            else:
-                # Very close to target, point straight down
-                self.gimbal_pitch = -np.pi / 2  # -90 degrees
-                self.gimbal_roll = 0.0
-        else:
-            # Keep gimbal level during other phases
-            self.gimbal_pitch = 0.0
-            self.gimbal_roll = 0.0
+        # Gimbal compensates for drone pitch to keep link1 pointing down in world frame
+        # When drone pitches up, gimbal pitches down to maintain vertical arm orientation
+        self.gimbal_pitch = -self.pitch
+        self.gimbal_roll = -self.roll
 
     def get_v(self):
-        """Desired null space"""
-        (t0,t1) = self.joint_pose
-        
-        # Select arm position based on mission phase
+        t0, t1 = self.joint_pose
+
         if self.phase == 'hover':
             pose_des = self.pose_des_hover
         elif self.phase == 'tap':
             pose_des = self.pose_des_tap
         else:
             pose_des = self.pose_des_goto
-        
-        v = np.array([
+
+        return np.array([
             [self.pose_k[0] * 0],
             [self.pose_k[1] * 0],
             [self.pose_k[2] * 0],
             [self.pose_k[3] * 0],
             [self.pose_k[4] * (pose_des[4] - t0)],
-            [self.pose_k[5] * (pose_des[5] - t1)]
-            ])
-        return v
+            [self.pose_k[5] * (pose_des[5] - t1)],
+        ])
 
-    def timer_callback(self):
-        """Calculates, q, the desired velocity to reach target and executes mission phases."""
-
-        # Wait until we have a defined start pose.
-        if self.start_pose is None:
+    def _maybe_finish_goal(self):
+        goal_handle = self.current_goal_handle
+        if goal_handle is None:
             return
 
-        # If we haven't received any targets yet, hold position until the first target arrives.
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            self.current_goal_handle = None
+            self.current_goal_target_index = None
+            return
+
+        feedback = SwitchTarget.Feedback()
+        feedback.current_target = self.target_index
+        current_pos = np.array([
+            self.end_effector_pose.position.x,
+            self.end_effector_pose.position.y,
+            self.end_effector_pose.position.z,
+        ])
+        desired_pos = self._compute_desired_position()
+        feedback.distance_to_target = float(np.linalg.norm(current_pos - desired_pos))
+        goal_handle.publish_feedback(feedback)
+
+        if self.phase == 'hover' and self.current_goal_target_index == self.target_index:
+            goal_handle.succeed()
+            self.current_goal_handle = None
+            self.current_goal_target_index = None
+            self.get_logger().info('SwitchTarget goal completed')
+
+    def timer_callback(self):
+        if not self._all_required_state_ready():
+            return
+
         if not any(self.targets_received):
             return
 
-        # Determine desired position based on mission phase.
         desired_pos = self._compute_desired_position()
 
-        # Phase transitions (based on end-effector, not drone base)
-        current_pos = np.array([self.end_effector_pose.position.x,
-                                self.end_effector_pose.position.y,
-                                self.end_effector_pose.position.z])
+        current_pos = np.array([
+            self.end_effector_pose.position.x,
+            self.end_effector_pose.position.y,
+            self.end_effector_pose.position.z,
+        ])
         dist = np.linalg.norm(current_pos - desired_pos)
 
         if self.phase == 'goto' and dist < self.arrival_threshold:
             self.phase = 'hover'
-            self.hover_start_time = time.time()
-            self.get_logger().info(f'Reached target; EE_pos={current_pos}, desired_pos={desired_pos}, dist={dist:.3f}; hovering for %.1fs' % self.hover_duration)
-        
-        # Fallback: if in goto phase too long, force go to hover anyway
+            self.phase_start_time = time.time()
+            self.hover_start_time = self.phase_start_time
+            self.last_hover_log_second = -1
+            self.get_logger().info(
+                f'Reached target; EE_pos={current_pos}, desired_pos={desired_pos}, '
+                f'dist={dist:.3f}; hovering for {self.hover_duration:.1f}s'
+            )
+
         if self.phase == 'goto':
             goto_elapsed = time.time() - self.phase_start_time
             if goto_elapsed >= self.goto_timeout:
-                self.get_logger().warn(f"Goto timeout ({goto_elapsed:.1f}s) reached! Forcing hover phase.")
+                self.get_logger().warn(f'Goto timeout ({goto_elapsed:.1f}s) reached! Forcing hover phase.')
                 self.phase = 'hover'
-                self.hover_start_time = time.time()
+                self.phase_start_time = time.time()
+                self.hover_start_time = self.phase_start_time
+                self.last_hover_log_second = -1
 
         if self.phase == 'hover':
             if self.hover_start_time is not None:
                 elapsed = time.time() - self.hover_start_time
                 if elapsed >= self.hover_duration:
-                    self.get_logger().warn(f"HOVER COMPLETE! Transitioning to TAP phase. (elapsed={elapsed:.2f}s)")
+                    self.get_logger().warn(f'HOVER COMPLETE! Transitioning to TAP phase. (elapsed={elapsed:.2f}s)')
                     self.phase = 'tap'
-                    self.tap_start_time = time.time()
-                elif int(elapsed) % 1 == 0:  # Log every 1 second
-                    self.get_logger().info(f"HOVER phase: elapsed={elapsed:.2f}s / {self.hover_duration}s, dist_to_target={dist:.3f}m")
+                    self.phase_start_time = time.time()
+                    self.tap_start_time = self.phase_start_time
+                else:
+                    elapsed_whole = int(elapsed)
+                    if elapsed_whole != self.last_hover_log_second:
+                        self.last_hover_log_second = elapsed_whole
+                        self.get_logger().info(
+                            f'HOVER phase: elapsed={elapsed:.2f}s / {self.hover_duration}s, '
+                            f'dist_to_target={dist:.3f}m'
+                        )
             else:
-                self.get_logger().warn("HOVER phase but hover_start_time is None!")
+                self.get_logger().warn('HOVER phase but hover_start_time is None!')
 
         if self.phase == 'tap':
             if self.tap_start_time is not None:
                 elapsed = time.time() - self.tap_start_time
-                self.get_logger().warn(f"TAP phase: elapsed={elapsed:.2f}s / {self.tap_duration}s, EE_Z={current_pos[2]:.3f}m, desired_Z={desired_pos[2]:.3f}m")
                 if elapsed >= self.tap_duration:
-                    self.get_logger().warn(f"TAP COMPLETE! Moving to next target.")
-                    # Move to the next target, or return home if done.
+                    self.get_logger().warn('TAP COMPLETE! Moving to next target.')
                     self.target_index += 1
                     while self.target_index < len(self.targets) and not self.targets_received[self.target_index]:
-                        self.get_logger().info(f"Skipping target {self.target_index + 1}: no data received")
+                        self.get_logger().info(f'Skipping target {self.target_index + 1}: no data received')
                         self.target_index += 1
 
                     if self.target_index < len(self.targets):
-                        self.phase = 'goto'
+                        self.phase = 'clear'  # Go to clear phase first
                         self.phase_start_time = time.time()
-                        self.get_logger().info(f"Going to target {self.target_index + 1}")
+                        self.get_logger().info(f'Clearing obstacles before going to target {self.target_index + 1}')
                     else:
                         self.phase = 'return'
                         self.phase_start_time = time.time()
                         self.get_logger().info('All targets tapped; returning to start')
             else:
-                self.get_logger().warn("TAP phase but tap_start_time is None!")
+                self.get_logger().warn('TAP phase but tap_start_time is None!')
+
+        if self.phase == 'clear':
+            # Clear phase: go to high altitude to avoid obstacles
+            clear_height = 2.0  # meters above current position
+            if current_pos[2] >= (self.drone_pose[2] + clear_height - self.arrival_threshold):
+                self.phase = 'goto'
+                self.phase_start_time = time.time()
+                self.get_logger().info(f'Cleared obstacles; going to target {self.target_index + 1}')
+            else:
+                elapsed = time.time() - self.phase_start_time
+                if int(elapsed) % 2 == 0:  # Log every 2 seconds
+                    self.get_logger().info(f'CLEAR phase: ascending to {self.drone_pose[2] + clear_height:.2f}m, current={current_pos[2]:.2f}m')
 
         if self.phase == 'return' and dist < self.arrival_threshold:
             self.phase = 'done'
+            self.phase_start_time = time.time()
             self.get_logger().info('Returned to start; mission done')
 
-        # Compute Jacobian and inverse once per cycle.
         j_mobile = J_mobile(self.links, self.joint_pose[0], self.joint_pose[1], self.yaw)
         j_mobile_inv = JMoore(j_mobile)
 
-        # q task
         pd_des = self.get_p_dot_des(desired_pos)
         pd_des += self._compute_target_avoidance_velocity(current_pos)
         q_task = j_mobile_inv @ pd_des
 
-        # q Null
         v = self.get_v()
         q_null = (np.eye(6) - j_mobile_inv @ j_mobile) @ v
 
-        # q dot
         if self.phase == 'done':
             q_dot = np.zeros((6, 1))
             if self.start_pose is not None:
@@ -527,7 +591,6 @@ class mobilejacobian(Node):
         else:
             q_dot = q_task + q_null
 
-        # Integrate velocity to get next setpoint using actual elapsed time
         now = self.get_clock().now()
         dt = (now - self.last_time).nanoseconds * 1e-9
         if dt <= 0:
@@ -535,14 +598,11 @@ class mobilejacobian(Node):
         self.last_time = now
 
         q_dot = self._rate_limit(q_dot, dt)
-
-        # Clamp commanded velocities to reasonable limits
         q_dot[0:3, 0] = np.clip(q_dot[0:3, 0], -self.max_linear_vel, self.max_linear_vel)
         q_dot[3, 0] = np.clip(q_dot[3, 0], -self.max_angular_vel, self.max_angular_vel)
         q_dot[4:6, 0] = np.clip(q_dot[4:6, 0], -self.max_joint_vel, self.max_joint_vel)
         self.last_q_dot = q_dot.copy()
 
-        # update commanded setpoint based on computed velocity
         if self.setpoint_pose is None:
             self.setpoint_pose = np.array(self.drone_pose)
             self.setpoint_yaw = self.yaw
@@ -550,115 +610,110 @@ class mobilejacobian(Node):
         self.setpoint_pose[0] += q_dot[0][0] * dt
         self.setpoint_pose[1] += q_dot[1][0] * dt
         self.setpoint_pose[2] += q_dot[2][0] * dt
-        self.setpoint_yaw += q_dot[3][0] * dt
+        self.setpoint_yaw = self._wrap_angle(self.setpoint_yaw + q_dot[3][0] * dt)
 
-        # Safety: clamp to optitrack bounds and don't command below the minimum allowed altitude
         self.setpoint_pose = self._clamp_to_optitrack_bounds(self.setpoint_pose)
 
-
-        # velocity bases
-        # cmd_lin = Vector3(x=q_dot[0][0],y=q_dot[1][0], z=q_dot[2][0])
-        # cmd_ang = Vector3(x=0.0, y=0.0, z=q_dot[3][0])
-        # cmd = Twist()
-        # cmd.linear = cmd_lin
-        # cmd.angular = cmd_ang
-        # self.drone_vel_pub.publish(cmd)
-
         cmd = PoseStamped()
-        cmd.pose.position.x = self.setpoint_pose[0]
-        cmd.pose.position.y = self.setpoint_pose[1]
-        cmd.pose.position.z = max(self.setpoint_pose[2], self.min_z)
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        if self.command_frame is not None:
+            cmd.header.frame_id = self.command_frame
+        cmd.pose.position.x = float(self.setpoint_pose[0])
+        cmd.pose.position.y = float(self.setpoint_pose[1])
+        cmd.pose.position.z = float(max(self.setpoint_pose[2], self.min_z))
 
-
-        Q = quaternion_from_euler(0,0,self.setpoint_yaw)
-        
-        cmd.pose.orientation = Quaternion(x = Q[0], y = Q[1], z = Q[2], w = Q[3])
+        q = quaternion_from_euler(0, 0, self.setpoint_yaw)
+        cmd.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         self.drone_pos_pub.publish(cmd)
 
-        # Compute and publish gimbal commands
         self._compute_gimbal_angles()
         cmd_gimbal = Float64MultiArray()
-        cmd_gimbal.data = [-self.gimbal_pitch, -self.gimbal_roll]
+        if self.use_degrees_for_gimbal:
+            cmd_gimbal.data = [math.degrees(self.gimbal_pitch), math.degrees(self.gimbal_roll)]
+        else:
+            cmd_gimbal.data = [self.gimbal_pitch, self.gimbal_roll]
         self.gimbal_pub.publish(cmd_gimbal)
 
-        # update arm joint position based on velosity
-        t0 = self.joint_pose[0] + q_dot[4][0] * dt
-        t1 = self.joint_pose[1] + q_dot[5][0] * dt
-        
+        t0 = np.clip(self.joint_pose[0] + q_dot[4][0] * dt, self.joint_min[0], self.joint_max[0])
+        t1 = np.clip(self.joint_pose[1] + q_dot[5][0] * dt, self.joint_min[1], self.joint_max[1])
         cmd_arm = Float64MultiArray()
-
-        # transmit new target positions
-        cmd_arm.data = [t0, t1]
+        cmd_arm.data = [float(t0), float(t1)]
         self.arm_pub.publish(cmd_arm)
 
+        self._maybe_finish_goal()
+
     def execute_callback(self, goal_handle):
-        """Execute the switch target action."""
         target_index = goal_handle.request.target_index
 
         if target_index < 0 or target_index >= len(self.targets):
             goal_handle.abort()
             result = SwitchTarget.Result()
             result.success = False
-            result.message = f"Invalid target index {target_index}. Must be 0-3."
+            result.message = f'Invalid target index {target_index}. Must be 0-3.'
             return result
 
         if not self.targets_received[target_index]:
             goal_handle.abort()
             result = SwitchTarget.Result()
             result.success = False
-            result.message = f"Target {target_index} not received yet."
+            result.message = f'Target {target_index} not received yet.'
             return result
 
-        # Set the target
+        if not self._all_required_state_ready():
+            goal_handle.abort()
+            result = SwitchTarget.Result()
+            result.success = False
+            result.message = 'Robot state not ready yet.'
+            return result
+
+        if self.current_goal_handle is not None:
+            goal_handle.abort()
+            result = SwitchTarget.Result()
+            result.success = False
+            result.message = 'Another SwitchTarget goal is already active.'
+            return result
+
+        self.current_goal_handle = goal_handle
+        self.current_goal_target_index = target_index
         self.target_index = target_index
         self.phase = 'goto'
         self.phase_start_time = time.time()
-        self.get_logger().info(f"Switching to target {target_index + 1}")
+        self.hover_start_time = None
+        self.tap_start_time = None
+        self.last_hover_log_second = -1
+        self.get_logger().info(f'Switching to target {target_index + 1}')
 
-        # Wait until reached
         while rclpy.ok():
-            if self.phase == 'hover':
-                break
+            if self.current_goal_handle is None:
+                result = SwitchTarget.Result()
+                if goal_handle.status == goal_handle.STATUS_SUCCEEDED:
+                    result.success = True
+                    result.message = f'Successfully switched to target {target_index + 1}'
+                elif goal_handle.status == goal_handle.STATUS_CANCELED:
+                    result.success = False
+                    result.message = 'Goal canceled'
+                else:
+                    result.success = False
+                    result.message = 'Goal ended without success'
+                return result
+            time.sleep(0.05)
 
-            # Publish feedback
-            feedback = SwitchTarget.Feedback()
-            feedback.current_target = self.target_index
-            current_pos = np.array([self.end_effector_pose.position.x,
-                                    self.end_effector_pose.position.y,
-                                    self.end_effector_pose.position.z])
-            desired_pos = self._compute_desired_position()
-            feedback.distance_to_target = float(np.linalg.norm(current_pos - desired_pos))
-            goal_handle.publish_feedback(feedback)
-
-            time.sleep(0.1)  # Small delay to not hog CPU
-
-        if goal_handle.is_cancel_requested:
-            goal_handle.canceled()
-            result = SwitchTarget.Result()
-            result.success = False
-            result.message = "Goal canceled"
-            return result
-
-        goal_handle.succeed()
         result = SwitchTarget.Result()
-        result.success = True
-        result.message = f"Successfully switched to target {target_index + 1}"
+        result.success = False
+        result.message = 'ROS shutdown before goal completion'
         return result
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = mobilejacobian()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-
-# # Potential action server main
-# def main(args=None):
-#     rclpy.init(args=args)
-#     action_server = inverse_jacobian()
-#     rclpy.spin(action_server)
+    node = MobileJacobian()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

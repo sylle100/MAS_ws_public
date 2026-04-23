@@ -1,0 +1,7 @@
+int32 target_index
+---
+bool success
+string message
+---
+int32 current_target
+float32 distance_to_target
