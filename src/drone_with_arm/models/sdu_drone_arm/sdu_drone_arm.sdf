@@ -127,7 +127,7 @@
     </link>
 
     <joint name='joint2' type='revolute'>
-      <pose relative_to='link1'>0 0 0.18 0 0 0</pose>
+      <pose relative_to='link1'>0 0 0.15 0 0 0</pose>
       <parent>link1</parent>
       <child>link2</child>
       <axis>
@@ -198,7 +198,7 @@
 
     <!-- Controller plugin for gimbal and arm -->
     <plugin name='gazebo_ros2_control' filename='libgazebo_ros2_control.so'>
-      <parameters>/home/sylle/MAS_ws_public/install/drone_with_arm/share/drone_with_arm/config/controllers.yaml</parameters>
+      <parameters>/home/chris/Documents/MAS_ws_public/install/drone_with_arm/share/drone_with_arm/config/controllers.yaml</parameters>
     </plugin>
     
     <!-- Plugin for end effector pose publishing -->

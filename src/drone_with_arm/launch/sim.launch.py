@@ -1,4 +1,6 @@
 import os
+import tempfile
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -23,11 +25,16 @@ def generate_launch_description():
     # build and src path from home
     build_px4_gaz = '/PX4-Autopilot/build/px4_sitl_default'
     src_px4_gaz = '/PX4-Autopilot'
+    pkg_models_dir = os.path.join(pkg_share, "models")
 
     # Environment variables for Gazebo
     extra_environment = [
         SetEnvironmentVariable(name='GAZEBO_PLUGIN_PATH', value=[EnvironmentVariable('GAZEBO_PLUGIN_PATH', default_value=''), ':', os.environ['HOME'], build_px4_gaz, '/build_gazebo']),
-        SetEnvironmentVariable(name='GAZEBO_MODEL_PATH', value=[EnvironmentVariable('GAZEBO_MODEL_PATH', default_value=''), ':', os.environ['HOME'], src_px4_gaz, '/Tools/sitl_gazebo/models']),
+        SetEnvironmentVariable(name='GAZEBO_MODEL_PATH', value=[
+            EnvironmentVariable('GAZEBO_MODEL_PATH', default_value=''),
+            ':', os.environ['HOME'], src_px4_gaz, '/Tools/sitl_gazebo/models',
+            ':', pkg_models_dir,
+        ]),
         SetEnvironmentVariable(name='LD_LIBRARY_PATH', value=[EnvironmentVariable('LD_LIBRARY_PATH', default_value=''), ':', os.environ['HOME'], build_px4_gaz, '/build_gazebo'])
     ]
 
@@ -39,7 +46,7 @@ def generate_launch_description():
         output="screen",
     )
 
-    world_file = "/home/sylle/MAS_ws_public/src/drone_with_arm/worlds/optitrack.world"
+    world_file = os.path.join(pkg_share, "worlds", "optitrack.world")
 
     # Gazebo (classic)
     gazebo = IncludeLaunchDescription(
@@ -55,9 +62,7 @@ def generate_launch_description():
         }.items()
     )
 
-    sdf_file = os.path.expanduser(
-    "~/MAS_ws_public/src/drone_with_arm/models/sdu_drone_arm/sdu_drone_arm.sdf" 
-    )
+    sdf_file = os.path.join(pkg_models_dir, "sdu_drone_arm", "sdu_drone_arm.sdf")
 
     spawn_entity = Node(
         package="gazebo_ros",
@@ -73,8 +78,9 @@ def generate_launch_description():
             "-Y", "0",
         ],
         output="screen",
-    )   
-    # Joint state broadcaster
+    )
+
+    # Start ros2_control controllers for the arm/gimbal command topics.
     joint_state_broadcaster = Node(
         package="controller_manager",
         executable="spawner",
@@ -85,7 +91,6 @@ def generate_launch_description():
         output="screen",
     )
 
-    # Arm controller
     arm_controller = Node(
         package="controller_manager",
         executable="spawner",
@@ -97,7 +102,6 @@ def generate_launch_description():
         output="screen",
     )
 
-    # Gimbal controller
     gimbal_controller = Node(
         package="controller_manager",
         executable="spawner",
@@ -108,7 +112,6 @@ def generate_launch_description():
         ],
         output="screen",
     )
-
     # spawn model by including px4_sitl_launch.py file and set it to be spawned.
     spawn_px4 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -123,6 +126,7 @@ def generate_launch_description():
             'ros2', 'run', 'mavros', 'mavros_node',
             '--ros-args',
             '--param', 'fcu_url:=udp://:14540@127.0.0.1:14557',
+            '--param', 'gcs_url:=udp://:14551@127.0.0.1:14550',
             '--param', 'plugin_denylist:=[odometry]'
         ],
         output='screen',
@@ -133,13 +137,20 @@ def generate_launch_description():
         x = random.uniform(-4, 4)
         y = random.uniform(-4, 4)
         z = random.uniform(-2.0, -0.5)
+        target_template = Path(pkg_models_dir) / "target_generic" / "target_generic.sdf"
+        target_xml = target_template.read_text()
+        target_xml = target_xml.replace("/TARGET_NAMESPACE", f"/{name}")
+        temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".sdf", delete=False)
+        temp_file.write(target_xml)
+        temp_file.flush()
+        temp_file.close()
 
         return Node(
             package="gazebo_ros",
             executable="spawn_entity.py",
             arguments=[
                 "-entity", name,
-                "-database", "target_generic",
+                "-file", temp_file.name,
                 "-x", str(x),
                 "-y", str(y),
                 "-z", str(z),
@@ -152,12 +163,13 @@ def generate_launch_description():
     targets = [spawn_target(f"target{i}") for i in range(1, 5)]
 
     return LaunchDescription([
+        *extra_environment,
         gazebo,
         robot_state_publisher,
         spawn_entity,
-        joint_state_broadcaster,
-        arm_controller,
-        gimbal_controller,
+        TimerAction(period=2.0, actions=[joint_state_broadcaster]),
+        TimerAction(period=2.5, actions=[arm_controller]),
+        TimerAction(period=3.0, actions=[gimbal_controller]),
         spawn_px4,
         mavros_node,
         *targets
