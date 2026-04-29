@@ -117,7 +117,7 @@ class MobileJacobian(Node):
         self.target_index = 0
 
         self.goto_timeout = 25.0
-        self.hover_height = 0.2
+        self.hover_height = 0.1  # meters above target (changed to hover 10cm above)
         self.approach_height = 0.2
         self.descend_radius_xy = 0.12
         self.target_avoid_radius = 0.30  # increased from 0.18
@@ -125,7 +125,7 @@ class MobileJacobian(Node):
         self.target_avoid_gain = 0.40  # increased from 0.25
         self.hover_duration = 2.0
         self.tap_depth = 0.22
-        self.tap_duration = 1.0
+        self.tap_duration = 5.0  # seconds to spend hovering over target (changed from 1.0)
         self.arrival_threshold = 0.10
 
         self.optitrack_x_min = -5.8
@@ -357,9 +357,8 @@ class MobileJacobian(Node):
                 return hover_pos
 
             if self.phase == 'tap':
-                tap_pos = hover_pos.copy()
-                tap_pos[2] = max(hover_pos[2] - self.tap_depth, self.min_z)
-                return tap_pos
+                # During tap phase, just hover 10cm above target for 5 seconds (no longer lowering to touch)
+                return hover_pos
 
             current_pos = np.array([
                 self.end_effector_pose.position.x,
@@ -521,7 +520,7 @@ class MobileJacobian(Node):
             if self.hover_start_time is not None:
                 elapsed = time.time() - self.hover_start_time
                 if elapsed >= self.hover_duration:
-                    self.get_logger().warn(f'HOVER COMPLETE! Transitioning to TAP phase. (elapsed={elapsed:.2f}s)')
+                    self.get_logger().warn(f'HOVER COMPLETE! Transitioning to TAP phase (hovering 10cm above target for {self.tap_duration}s). (elapsed={elapsed:.2f}s)')
                     self.phase = 'tap'
                     self.phase_start_time = time.time()
                     self.tap_start_time = self.phase_start_time
@@ -539,6 +538,13 @@ class MobileJacobian(Node):
         if self.phase == 'tap':
             if self.tap_start_time is not None:
                 elapsed = time.time() - self.tap_start_time
+                elapsed_whole = int(elapsed)
+                if elapsed_whole != getattr(self, 'last_tap_log_second', -1):
+                    self.last_tap_log_second = elapsed_whole
+                    self.get_logger().info(
+                        f'TAP phase (hovering 10cm above target): elapsed={elapsed:.2f}s / {self.tap_duration}s, '
+                        f'dist_to_target={dist:.3f}m'
+                    )
                 if elapsed >= self.tap_duration:
                     self.get_logger().warn('TAP COMPLETE! Moving to next target.')
                     self.target_index += 1
@@ -553,7 +559,7 @@ class MobileJacobian(Node):
                     else:
                         self.phase = 'return'
                         self.phase_start_time = time.time()
-                        self.get_logger().info('All targets tapped; returning to start')
+                        self.get_logger().info('All targets hovered over; returning to start')
             else:
                 self.get_logger().warn('TAP phase but tap_start_time is None!')
 
