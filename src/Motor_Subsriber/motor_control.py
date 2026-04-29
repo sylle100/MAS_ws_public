@@ -16,7 +16,10 @@ GIMBAL_IDS = [1, 2]   # motor 1,2
 ARM_IDS    = [3, 4]   # motor 3,4
 ALL_IDS    = GIMBAL_IDS + ARM_IDS
 
-portHandler = PortHandler("/dev/ttyUSB1")
+l1=0.15
+l2=0.1338
+
+portHandler = PortHandler("/dev/ttyUSB1")  # Update to correct port
 packetHandler = PacketHandler(2.0)
 
 
@@ -37,7 +40,7 @@ class CombinedDynamixelController(Node):
 
         # Store positions
         self.gimbal_positions = [315.0, 315.0]
-        self.arm_positions = [180.0, 180.0]
+        self.arm_positions = [160.0, 60.0]
 
         # -------- SUBSCRIBERS --------
 
@@ -105,15 +108,21 @@ class CombinedDynamixelController(Node):
             joint1_deg = rad_to_deg(msg.data[0])
             joint2_deg = rad_to_deg(msg.data[1])
 
-            # Map to Dynamixel range (center = 180°)
-            m3 = joint1_deg
-            m4 = joint2_deg
+                    # Forward kinematics (end-effector position)
+            x = l1 * math.cos(joint1_deg) + l2 * math.cos(joint1_deg + joint2_deg)
+            y = l1 * math.sin(joint1_deg) + l2 * math.sin(joint1_deg + joint2_deg)
+
+            if y > 0:
+                # Map to Dynamixel range (center = 180°)
+                m3 = joint1_deg
+                m4 = joint2_deg
 
             self.arm_positions = [m3, m4]
 
             self.get_logger().info(
                 f"Arm cmd → rad: [{msg.data[0]:.2f}, {msg.data[1]:.2f}] "
                 f"deg: [{m3:.1f}, {m4:.1f}]"
+                f" → FK (x,y): [{x:.3f}, {y:.3f}]"
             )
         else:
             self.get_logger().warn("Arm needs 2 joints")
